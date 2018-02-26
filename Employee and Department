@@ -1,0 +1,139 @@
+from pyspark.sql import SparkSession
+from pyspark import SparkContext
+
+spark = SparkSession \
+ .builder \
+ .appName("SCD") \
+ .getOrCreate()
+
+//After acquiring raw data create hive tables
+
+1295847284Chief Executive Officer2009-01-14KenSÃ¡nchez16Executive2009-01-14nulltrue
+
+CREATE EXTERNAL TABLE IF NOT EXISTS employee_status
+(
+businessEntityId int,
+nationalIdNumber int,
+jobTitle string,
+hireDate string,
+firstName string,
+lastName string,
+departmentId int,
+departmentName string,
+startDate string,
+endDate string,
+currentFlag int
+)
+ROW FORMAT DELIMITED
+FIELDS TERMINATED BY ','
+LINES TERMINATED BY '\n'
+STORED AS TEXTFILE
+LOCATION '/user/daniel/projectscd/mysql/employee_status';
+
+departmentId, name, groupName, modifiedDate
+1,Engineering,Research and Development,2008-04-29 22:00:00.0
+
+CREATE EXTERNAL TABLE IF NOT EXISTS department 
+(
+departmentId int, 
+name string, 
+groupName string, 
+modifiedDate string
+)
+ROW FORMAT DELIMITED 
+FIELDS TERMINATED BY ',' 
+LINES TERMINATED BY '\n'
+STORED AS TEXTFILE
+LOCATION '/user/daniel/projectscd/mysql/department';
+
+(EmployeeUpdate1)
+NationalIDNumber,JobTitle,FirstName,LastName,DepartmentID,DeptName
+245797967,Chief Executive Officer,Terri,Duffy,16,Executive
+
+(EmployeeDeptUpdate2)
+NationalIDNumber,JobTitle,FirstName,LastName,DepartmentID,DeptName
+897873210,Design Engineer,Trisha,Sharma,1,Engineering
+
+//pyspark data processing
+PYSPARK 2
+spark = SparkSession(sc)
+import pyspark.sql.functions as F
+
+sourceText = sc.textFile("/user/daniel/projectscd/mysql/employee_status")
+sourceSchema = ('BusinessEntityID','NationalIDNumber','JobTitle','HireDate','FirstName','LastName','DepartmentID','DepartmentName','StartDate','EndDate','CurrentFlag')
+sourcerdd = sourceText.map(lambda x: x.split(","))
+sourcedf = spark.createDataFrame(sourcerdd,sourceSchema)
+
+deptText = sc.textFile("/user/daniel/projectscd/mysql/department")
+deptSchema = ('DepartmentId','Name','GroupName','ModifiedDate')
+deptrdd = deptText.map(lambda x: x.split(","))
+deptdf = spark.createDataFrame(deptrdd,deptSchema)
+
+UPDATE ONE
+updateOnedf = spark.read.csv('/user/daniel/projectscd/update/EmployeeDeptUpdate1.csv', header=True)
+updateOnedf1 = updateOnedf.withColumn('StartDate',pyspark.sql.functions.current_date())
+updateOnedf2 = updateOnedf1.withColumn('EndDate', pyspark.sql.functions.lit('9999-12-31'))
+updateOnedf3 = updateOnedf2.withColumn('CurrentFlag', pyspark.sql.functions.lit('Y'))
+updateOnedf4 = updateOnedf3.withColumn('BusinessEntityID', pyspark.sql.functions.monotonically_increasing_id())
+updateOnedf5 = updateOnedf4.withColumn('HireDate', pyspark.sql.functions.lit('null'))
+updateOnedf6 = updateOnedf5.select('BusinessEntityID','NationalIDNumber','JobTitle','HireDate','FirstName','LastName','DepartmentID','DeptName','StartDate','EndDate','CurrentFlag')
+updateOnedf7 = updateOnedf6.withColumnRenamed('DeptName','DepartmentName')
+updateOnedf7.registerTempTable("updateOne")
+
+//replace DepartmentID with 999 if NationalIDNumber equal to retiredTracker
+retired = updateOnedf7.filter(updateOnedf7['DepartmentID'] == 999)
+updateOneWithoutRetired = updateOnedf7.filter(updateOnedf7['DepartmentID'] != 999)
+//list of str from column NationalIDNumber
+retiredTracker = []
+for i in retired.collect(): retiredTracker.append(i.NationalIDNumber)
+
+current = updateOnedf7.join(sourcedf, ['NationalIDNumber']).where(updateOnedf7['DepartmentID'] != 999)
+currentTracker = []
+for i in current.collect(): currentTracker.append(i.NationalIDNumber)
+
+//set variables for current date and yesterday
+from datetime import date, timedelta
+today = (date.today()).strftime("%Y-%m-%d")
+yesterday = (date.today() - timedelta(1)).strftime("%Y-%m-%d")
+
+//modifications to source df
+for i in range(len(retiredTracker)): sourcedf = sourcedf.withColumn("DepartmentID", \
+              pyspark.sql.functions.when(sourcedf["NationalIDNumber"] == retiredTracker[i], 999).otherwise(sourcedf["DepartmentID"]))
+for i in range(len(currentTracker)): sourcedf = sourcedf.withColumn("CurrentFlag", \
+              pyspark.sql.functions.when(sourcedf["NationalIDNumber"] == currentTracker[i], "N").otherwise(sourcedf["CurrentFlag"].cast('string')))
+//check = sourcedf.filter(sourcedf.NationalIDNumber == "245797967")
+for i in range(len(currentTracker)): sourcedf = sourcedf.withColumn("EndDate", \
+              pyspark.sql.functions.when(sourcedf["NationalIDNumber"] == currentTracker[i], yesterday).otherwise(sourcedf["EndDate"]))
+
+//append new employees and current employees with only dept change
+sourcedfFinal = sourcedf.union(updateOneWithoutRetired)
+
+//reset the surrogate id number
+count = sourcedfFinal.count()
+for i in range(count): sourcedfFinal1 = sourcedfFinal.withColumn("BusinessEntityID", \
+              pyspark.sql.functions.when(sourcedfFinal["BusinessEntityID"] != i, i).otherwise(sourcedfFinal["BusinessEntityID"]))
+
+//create temp table and save
+sourcedfFinal.createOrReplaceTempView("sourceFinalTemp") 
+
+//save to data source and create hive table
+sourcedfFinal.write.save('user/daniel/projectscd/final/sourcedfFinal.csv', format='parquet')
+
+create external table if not exists sourcedfFinal (
+BusinessEntityID int,
+NationalIDNumber int,
+JobTitle string,
+HireDate string,
+FirstName string,
+LastName string,
+DepartmentID int,
+DepartmentName string,
+StartDate string,
+EndDate string,
+CurrentFlag string
+)
+ROW FORMAT DELIMITED
+FIELDS TERMINATED BY ','
+LINES TERMINATED BY '\n'
+STORED AS TEXTFILE
+LOCATION '/user/daniel/projectscd/sourcedfFinalcsv';
